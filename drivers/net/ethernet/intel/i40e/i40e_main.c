@@ -87,6 +87,10 @@ static int debug = -1;
 module_param(debug, uint, 0);
 MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all), Debug mask (0x8XXXXXXX)");
 
+static int xdp_hint_level = 0;
+module_param(xdp_hint_level, int, 0644);
+MODULE_PARM_DESC(xdp_hint_level, "Populate XDP hints 0=nil 1=minimal 2=maximal");
+
 MODULE_AUTHOR("Intel Corporation, <e1000-devel@lists.sourceforge.net>");
 MODULE_DESCRIPTION("Intel(R) Ethernet Connection XL710 Network Driver");
 MODULE_LICENSE("GPL");
@@ -14034,6 +14038,8 @@ static int i40e_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		pf->hw_features |= I40E_HW_PHY_CONTROLS_LEDS;
 	if (pf->hw.device_id == I40E_DEV_ID_SFP_I_X722)
 		pf->hw_features |= I40E_HW_HAVE_CRT_RETIMER;
+
+	pf->xdp_hint_level = xdp_hint_level;
 	/* print a string summarizing features */
 	i40e_print_features(pf);
 

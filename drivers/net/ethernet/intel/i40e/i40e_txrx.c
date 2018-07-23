@@ -5,6 +5,7 @@
 #include <net/busy_poll.h>
 #include <linux/bpf_trace.h>
 #include <net/xdp.h>
+#include <asm/msr.h>
 #include "i40e.h"
 #include "i40e_trace.h"
 #include "i40e_prototype.h"
@@ -2293,6 +2294,160 @@ static inline void i40e_xdp_ring_update_tail(struct i40e_ring *xdp_ring)
 	 */
 	wmb();
 	writel_relaxed(xdp_ring->next_to_use, xdp_ring->tail);
+};
+
+const size_t len_ethhdr = sizeof(struct ethhdr);
+const size_t len_ipv4hdr = sizeof(struct iphdr);
+const size_t len_ipv6hdr = sizeof(struct ipv6hdr);
+
+enum XDP_META_PTYPE
+{
+	XDP_META_PTYPE_VALID,
+	XDP_META_PTYPE_IPV6,
+	XDP_META_PTYPE_TCP,
+	XDP_META_PTYPE_UDP,
+	XDP_META_PTYPE_ICMP,
+	XDP_META_PTYPE_END
+};
+
+/* #define PARSE_HEADERS */
+struct xdp_hw_hints
+{
+	DECLARE_BITMAP(ptype,XDP_META_PTYPE_END);
+	u32 hash;
+	u8 l3hdroffset;
+	u8 l4hdroffset;
+	u8 proto;
+	bool fragmented;
+#ifdef PARSE_HEADERS
+	union {
+		__be32 addr4;
+		__be32 addr6[4];
+	}srcip;
+	union  {
+		__be32 addr4;
+		__be32 addr6[4];
+	}dstip;
+	__u16 srcport;
+	__u16 dstport;
+#endif
+};
+
+/**
+ * i40e_process_hints - Retrieve the packet info from hw and package it
+ **/
+static void i40e_process_hints(union i40e_rx_desc *rxdesc,
+			       struct xdp_buff *xdp)
+{
+
+	struct i40e_rx_ptype_decoded ptype={0};
+	u16 fltstatus = 0;
+	unsigned long long start, end;
+	struct xdp_hw_hints hints = {0};
+	start = rdtsc();
+
+	do {
+		u64 stserr = rxdesc->wb.qword1.status_error_len;
+		u64 sts = stserr & 0xFFFF;
+		struct iphdr *ip4h;
+		struct ipv6hdr *ip6h;
+		struct tcphdr *tcph;
+		struct udphdr *udph;
+
+		// Check if the packet is complete
+		if (!(sts & BIT(I40E_RX_DESC_STATUS_DD_SHIFT)))
+			break;
+
+		ptype = i40e_ptype_lookup[(stserr & I40E_RXD_QW1_PTYPE_MASK) >>
+			I40E_RXD_QW1_PTYPE_SHIFT];
+		if (!ptype.known)
+			break;
+
+		hints.l3hdroffset = len_ethhdr;
+		/*
+		 * Adjustment for vlan tag - Not needed for loadbalancers
+		 *
+		 * if (rxdesc->wb.qword1.status_error_len &
+		 *                      (0x1ULL << (I40E_RX_DESC_STATUS_L2TAG1P_SHIFT + I40E_RXD_QW1_STATUS_SHIFT)))
+		 * hints.l3hdroffset += 4;
+		 */
+
+		set_bit(XDP_META_PTYPE_VALID, hints.ptype);
+		if(ptype.outer_ip == I40E_RX_PTYPE_OUTER_IP) {
+			if (ptype.outer_ip_ver == I40E_RX_PTYPE_OUTER_IPV4) {
+				/* IPv4 packet */
+				clear_bit(XDP_META_PTYPE_IPV6, hints.ptype);
+				ip4h = xdp->data + hints.l3hdroffset;
+				hints.proto = ip4h->protocol;
+#ifdef PARSE_HEADERS
+				hints.srcip.addr4 = ip4h->saddr;
+				hints.dstip.addr4 = ip4h->daddr;
+#endif
+				hints.l4hdroffset = len_ethhdr + ip4h->ihl * 4;
+
+			}
+			else if (ptype.outer_ip_ver == I40E_RX_PTYPE_OUTER_IPV6){
+				/* IPv6 packet */
+				set_bit(XDP_META_PTYPE_IPV6, hints.ptype);
+				ip6h = xdp->data + hints.l3hdroffset;
+				hints.proto = ip6h->nexthdr;
+#ifdef PARSE_HEADERS
+				memcpy(hints.srcip.addr6,
+				       ip6h->saddr.s6_addr32,16);
+				memcpy(hints.dstip.addr6,
+				       ip6h->daddr.s6_addr32, 16);
+#endif
+				/* Todo: Adjust for IP Options */
+				hints.l4hdroffset = len_ethhdr + len_ipv6hdr;
+			}
+		}
+
+		hints.fragmented = ptype.outer_frag;
+		trace_printk("ptype=%d IPV6= %d inner_proto= %d hash %x fragmented:%d l3hdroffset:%d"
+		       " l4hdroffset:%d",ptype.ptype, ptype.outer_ip_ver,
+		       ptype.inner_prot, hints.hash, hints.fragmented,
+		       hints.l3hdroffset,hints.l4hdroffset);
+
+		if (hints.fragmented)
+			break;
+
+		if (ptype.inner_prot == I40E_RX_PTYPE_INNER_PROT_UDP ) {
+			set_bit(XDP_META_PTYPE_UDP,hints.ptype);
+			udph = xdp->data + hints.l4hdroffset;
+#ifdef PARSE_HEADERS
+			hints.srcport = htons(udph->source);
+			hints.dstport = htons(udph->dest);
+#endif
+		}
+		else if (ptype.inner_prot == I40E_RX_PTYPE_INNER_PROT_TCP) {
+			set_bit(XDP_META_PTYPE_TCP, hints.ptype);
+			tcph = xdp->data + hints.l4hdroffset;
+#ifdef PARSE_HEADERS
+			hints.srcport = htons(tcph->source);
+			hints.dstport = htons(tcph->dest);
+#endif
+		}
+		else if (ptype.inner_prot == I40E_RX_PTYPE_INNER_PROT_ICMP) {
+			set_bit(XDP_META_PTYPE_ICMP, hints.ptype);
+		}
+
+
+		fltstatus = (stserr >> I40E_RX_DESC_STATUS_FLTSTAT_SHIFT) &
+			I40E_RX_DESC_FLTSTAT_RSS_HASH;
+		if (fltstatus == I40E_RX_DESC_FLTSTAT_RSS_HASH)
+			hints.hash = rxdesc->wb.qword0.hi_dword.rss;
+#ifdef PARSE_HEADERS
+		trace_printk("SrcAddr=%X DestAddr=%X srcport=%d dstport=%d",
+		       hints.srcip.addr4, hints.dstip.addr4, hints.srcport,
+		       hints.dstport);
+#endif
+	}while(0);
+
+	xdp->data_meta = xdp->data - sizeof(struct xdp_hw_hints);
+	memcpy(xdp->data_meta, &hints, sizeof(struct xdp_hw_hints));
+
+	end = rdtsc();
+	trace_printk("Total cycles: %llu",end-start);
 }
 
 /**
@@ -2313,6 +2468,7 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 	struct sk_buff *skb = rx_ring->skb;
 	u16 cleaned_count = I40E_DESC_UNUSED(rx_ring);
 	bool failure = false, xdp_xmit = false;
+	struct i40e_pf *pf = rx_ring->vsi->back;
 	struct xdp_buff xdp;
 
 	xdp.rxq = &rx_ring->xdp_rxq;
@@ -2367,8 +2523,14 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 			xdp.data_meta = xdp.data;
 			xdp.data_hard_start = xdp.data -
 					      i40e_rx_offset(rx_ring);
-			xdp.data_end = xdp.data + size;
 
+			/* Retrieve hints from HW if there is enough room
+			 * available */
+			if (pf->xdp_hint_level && (i40e_rx_offset(rx_ring) >
+			    sizeof(struct xdp_hw_hints))) {
+				i40e_process_hints(rx_desc, &xdp);
+			}
+			xdp.data_end = xdp.data + size;
 			skb = i40e_run_xdp(rx_ring, &xdp);
 		}
 
